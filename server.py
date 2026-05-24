@@ -7,8 +7,10 @@
 # ///
 """Local MCP server wrapping yt-dlp. No YouTube API key required.
 
-Exposes four tools:
+Exposes six tools:
   - get_transcript: return captions as plain text
+  - extract_frames: capture frames at regular intervals for visual analysis
+  - snapshot: capture frames at specific user-supplied timestamps
   - download_subtitles: write subtitle file(s) to disk
   - download_audio: download + convert to mp3/m4a/etc.
   - download_video: download (optionally capped resolution) and merge to mp4
@@ -19,7 +21,9 @@ is reserved for the MCP JSON-RPC stream.
 
 from __future__ import annotations
 
+import base64
 import re
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -115,6 +119,154 @@ def get_transcript(url: str, language: str = "en") -> dict[str, Any]:
             "title": info.get("title"),
             "video_id": info.get("id"),
         }
+
+
+def _parse_timestamp(ts: str) -> float:
+    """Parse a timestamp string like '1:23', '02:45', '1:02:30', or '90' into seconds."""
+    parts = ts.strip().split(":")
+    parts = [float(p) for p in parts]
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    return parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def _format_timestamp(seconds: float) -> str:
+    """Format seconds into MM:SS or HH:MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _download_and_extract_frames(
+    url: str,
+    timestamps: list[float],
+    max_height: int,
+    output_dir: str | None,
+) -> dict[str, Any]:
+    """Download a video and extract frames at the given timestamps.
+
+    Returns a dict with title, video_id, duration, and a list of frame entries
+    each containing timestamp_seconds, timestamp, base64_jpeg, and optionally file_path.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = str(Path(tmp) / "video.mp4")
+        opts = {
+            **_quiet_opts(),
+            "format": f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": video_path,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        title = info.get("title", "")
+        video_id = info.get("id", "")
+        duration = info.get("duration") or 0
+
+        frames_dir = Path(tmp) / "frames"
+        frames_dir.mkdir()
+
+        frame_paths: list[Path] = []
+        for i, ts in enumerate(timestamps):
+            out_path = frames_dir / f"frame_{i:04d}.jpg"
+            subprocess.run(
+                [
+                    "ffmpeg", "-ss", str(ts), "-i", video_path,
+                    "-vframes", "1",
+                    "-vf", f"scale=-2:{max_height}",
+                    "-q:v", "2",
+                    "-y", str(out_path),
+                ],
+                capture_output=True,
+            )
+            if out_path.exists():
+                frame_paths.append(out_path)
+
+        save_dir = _expand_dir(output_dir) if output_dir else None
+        frames_data: list[dict[str, Any]] = []
+
+        for path, ts in zip(frame_paths, timestamps):
+            image_bytes = path.read_bytes()
+            entry: dict[str, Any] = {
+                "timestamp_seconds": ts,
+                "timestamp": _format_timestamp(ts),
+                "base64_jpeg": base64.b64encode(image_bytes).decode("ascii"),
+            }
+            if save_dir:
+                save_path = save_dir / f"{title} [{video_id}] frame_{ts:.1f}s.jpg"
+                save_path.write_bytes(image_bytes)
+                entry["file_path"] = str(save_path)
+            frames_data.append(entry)
+
+        return {
+            "title": title,
+            "video_id": video_id,
+            "duration_seconds": duration,
+            "frame_count": len(frames_data),
+            "frames": frames_data,
+        }
+
+
+@mcp.tool()
+def extract_frames(
+    url: str,
+    interval_seconds: float = 10.0,
+    max_frames: int = 20,
+    max_height: int = 720,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    """Extract frames from a video at regular intervals for visual analysis.
+
+    Downloads the video to a temp file, then uses ffmpeg to capture frames.
+    Returns base64-encoded JPEG images so the LLM can see the video content.
+
+    interval_seconds: time between captures (default 10s).
+    max_frames: cap on total frames returned (default 20).
+    max_height: scale down frames to this height (default 720).
+    output_dir: if provided, also saves frames to disk; otherwise only returns base64.
+    """
+    # Fetch duration first to compute timestamps
+    with yt_dlp.YoutubeDL({**_quiet_opts(), "skip_download": True}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    duration = info.get("duration") or 0
+
+    timestamps: list[float] = []
+    t = 0.0
+    while t < duration and len(timestamps) < max_frames:
+        timestamps.append(t)
+        t += interval_seconds
+    if not timestamps:
+        timestamps = [0.0]
+
+    result = _download_and_extract_frames(url, timestamps, max_height, output_dir)
+    result["interval_seconds"] = interval_seconds
+    return result
+
+
+@mcp.tool()
+def snapshot(
+    url: str,
+    timestamps: list[str],
+    max_height: int = 720,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    """Capture frames at specific timestamps from a video.
+
+    Use this when the user requests snapshots/screenshots at particular moments.
+    Each frame is returned as a base64-encoded JPEG with its timestamp.
+
+    timestamps: list of timestamp strings, e.g. ["0:30", "2:45", "1:02:30"].
+        Supports formats: "SS", "MM:SS", "HH:MM:SS".
+    max_height: scale down frames to this height (default 720).
+    output_dir: if provided, also saves frames to disk; otherwise only returns base64.
+    """
+    parsed = [_parse_timestamp(ts) for ts in timestamps]
+    return _download_and_extract_frames(url, parsed, max_height, output_dir)
 
 
 @mcp.tool()
