@@ -145,19 +145,21 @@ def _format_timestamp(seconds: float) -> str:
 def _download_and_extract_frames(
     url: str,
     timestamps: list[float],
-    max_height: int,
     output_dir: str | None,
 ) -> dict[str, Any]:
     """Download a video and extract frames at the given timestamps.
 
+    Downloads at best available quality and extracts frames at original
+    resolution with no re-encoding quality loss (lossless PNG).
+
     Returns a dict with title, video_id, duration, and a list of frame entries
-    each containing timestamp_seconds, timestamp, base64_jpeg, and optionally file_path.
+    each containing timestamp_seconds, timestamp, base64_png, and optionally file_path.
     """
     with tempfile.TemporaryDirectory() as tmp:
         video_path = str(Path(tmp) / "video.mp4")
         opts = {
             **_quiet_opts(),
-            "format": f"bestvideo[height<={max_height}]+bestaudio/best[height<={max_height}]/best",
+            "format": "bestvideo+bestaudio/best",
             "merge_output_format": "mp4",
             "outtmpl": video_path,
         }
@@ -173,13 +175,11 @@ def _download_and_extract_frames(
 
         frame_paths: list[Path] = []
         for i, ts in enumerate(timestamps):
-            out_path = frames_dir / f"frame_{i:04d}.jpg"
+            out_path = frames_dir / f"frame_{i:04d}.png"
             subprocess.run(
                 [
                     "ffmpeg", "-ss", str(ts), "-i", video_path,
                     "-vframes", "1",
-                    "-vf", f"scale=-2:{max_height}",
-                    "-q:v", "2",
                     "-y", str(out_path),
                 ],
                 capture_output=True,
@@ -195,10 +195,10 @@ def _download_and_extract_frames(
             entry: dict[str, Any] = {
                 "timestamp_seconds": ts,
                 "timestamp": _format_timestamp(ts),
-                "base64_jpeg": base64.b64encode(image_bytes).decode("ascii"),
+                "base64_png": base64.b64encode(image_bytes).decode("ascii"),
             }
             if save_dir:
-                save_path = save_dir / f"{title} [{video_id}] frame_{ts:.1f}s.jpg"
+                save_path = save_dir / f"{title} [{video_id}] frame_{ts:.1f}s.png"
                 save_path.write_bytes(image_bytes)
                 entry["file_path"] = str(save_path)
             frames_data.append(entry)
@@ -217,17 +217,15 @@ def extract_frames(
     url: str,
     interval_seconds: float = 10.0,
     max_frames: int = 20,
-    max_height: int = 720,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
     """Extract frames from a video at regular intervals for visual analysis.
 
-    Downloads the video to a temp file, then uses ffmpeg to capture frames.
-    Returns base64-encoded JPEG images so the LLM can see the video content.
+    Downloads the video at best available quality and captures frames at
+    original resolution as lossless PNGs.
 
     interval_seconds: time between captures (default 10s).
     max_frames: cap on total frames returned (default 20).
-    max_height: scale down frames to this height (default 720).
     output_dir: if provided, also saves frames to disk; otherwise only returns base64.
     """
     # Fetch duration first to compute timestamps
@@ -243,7 +241,7 @@ def extract_frames(
     if not timestamps:
         timestamps = [0.0]
 
-    result = _download_and_extract_frames(url, timestamps, max_height, output_dir)
+    result = _download_and_extract_frames(url, timestamps, output_dir)
     result["interval_seconds"] = interval_seconds
     return result
 
@@ -252,21 +250,20 @@ def extract_frames(
 def snapshot(
     url: str,
     timestamps: list[str],
-    max_height: int = 720,
     output_dir: str | None = None,
 ) -> dict[str, Any]:
     """Capture frames at specific timestamps from a video.
 
     Use this when the user requests snapshots/screenshots at particular moments.
-    Each frame is returned as a base64-encoded JPEG with its timestamp.
+    Downloads at best available quality and captures at original resolution
+    as lossless PNGs.
 
     timestamps: list of timestamp strings, e.g. ["0:30", "2:45", "1:02:30"].
         Supports formats: "SS", "MM:SS", "HH:MM:SS".
-    max_height: scale down frames to this height (default 720).
     output_dir: if provided, also saves frames to disk; otherwise only returns base64.
     """
     parsed = [_parse_timestamp(ts) for ts in timestamps]
-    return _download_and_extract_frames(url, parsed, max_height, output_dir)
+    return _download_and_extract_frames(url, parsed, output_dir)
 
 
 @mcp.tool()
