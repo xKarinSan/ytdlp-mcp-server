@@ -149,17 +149,20 @@ def _download_and_extract_frames(
 ) -> dict[str, Any]:
     """Download a video and extract frames at the given timestamps.
 
-    Downloads at best available quality and extracts frames at original
-    resolution with no re-encoding quality loss (lossless PNG).
+    Strategy for staying within MCP tool response limits:
+    - Downloads video at 720p (sufficient for visual analysis, keeps frames small).
+    - Extracts frames as high-quality JPEG (q:v 2 ≈ 95% quality, ~50-150KB each).
+    - If output_dir is set, also saves full-resolution PNG originals to disk.
 
     Returns a dict with title, video_id, duration, and a list of frame entries
-    each containing timestamp_seconds, timestamp, base64_png, and optionally file_path.
+    each containing timestamp_seconds, timestamp, base64_jpeg, and optionally file_path.
     """
     with tempfile.TemporaryDirectory() as tmp:
         video_path = str(Path(tmp) / "video.mp4")
+        # Download at 720p for base64 response (keeps payload manageable)
         opts = {
             **_quiet_opts(),
-            "format": "bestvideo+bestaudio/best",
+            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
             "merge_output_format": "mp4",
             "outtmpl": video_path,
         }
@@ -173,13 +176,15 @@ def _download_and_extract_frames(
         frames_dir = Path(tmp) / "frames"
         frames_dir.mkdir()
 
+        # Extract frames as JPEG (high quality, compact size)
         frame_paths: list[Path] = []
         for i, ts in enumerate(timestamps):
-            out_path = frames_dir / f"frame_{i:04d}.png"
+            out_path = frames_dir / f"frame_{i:04d}.jpg"
             subprocess.run(
                 [
                     "ffmpeg", "-ss", str(ts), "-i", video_path,
                     "-vframes", "1",
+                    "-q:v", "2",
                     "-y", str(out_path),
                 ],
                 capture_output=True,
@@ -187,20 +192,43 @@ def _download_and_extract_frames(
             if out_path.exists():
                 frame_paths.append(out_path)
 
+        # If output_dir specified, also save full-res originals
         save_dir = _expand_dir(output_dir) if output_dir else None
-        frames_data: list[dict[str, Any]] = []
+        if save_dir:
+            # Re-download at best quality for disk saves
+            full_video_path = str(Path(tmp) / "video_full.mp4")
+            full_opts = {
+                **_quiet_opts(),
+                "format": "bestvideo+bestaudio/best",
+                "merge_output_format": "mp4",
+                "outtmpl": full_video_path,
+            }
+            with yt_dlp.YoutubeDL(full_opts) as ydl:
+                ydl.extract_info(url, download=True)
 
+            for i, ts in enumerate(timestamps):
+                save_path = save_dir / f"{title} [{video_id}] frame_{ts:.1f}s.png"
+                subprocess.run(
+                    [
+                        "ffmpeg", "-ss", str(ts), "-i", full_video_path,
+                        "-vframes", "1",
+                        "-y", str(save_path),
+                    ],
+                    capture_output=True,
+                )
+
+        frames_data: list[dict[str, Any]] = []
         for path, ts in zip(frame_paths, timestamps):
             image_bytes = path.read_bytes()
             entry: dict[str, Any] = {
                 "timestamp_seconds": ts,
                 "timestamp": _format_timestamp(ts),
-                "base64_png": base64.b64encode(image_bytes).decode("ascii"),
+                "base64_jpeg": base64.b64encode(image_bytes).decode("ascii"),
             }
             if save_dir:
                 save_path = save_dir / f"{title} [{video_id}] frame_{ts:.1f}s.png"
-                save_path.write_bytes(image_bytes)
-                entry["file_path"] = str(save_path)
+                if save_path.exists():
+                    entry["file_path"] = str(save_path)
             frames_data.append(entry)
 
         return {
@@ -221,12 +249,12 @@ def extract_frames(
 ) -> dict[str, Any]:
     """Extract frames from a video at regular intervals for visual analysis.
 
-    Downloads the video at best available quality and captures frames at
-    original resolution as lossless PNGs.
+    Returns compact base64 JPEGs (720p) in the response for the LLM to analyze.
+    If output_dir is set, also saves full-resolution PNG originals to disk.
 
     interval_seconds: time between captures (default 10s).
     max_frames: cap on total frames returned (default 20).
-    output_dir: if provided, also saves frames to disk; otherwise only returns base64.
+    output_dir: if provided, also saves full-res frames to disk.
     """
     # Fetch duration first to compute timestamps
     with yt_dlp.YoutubeDL({**_quiet_opts(), "skip_download": True}) as ydl:
@@ -255,12 +283,12 @@ def snapshot(
     """Capture frames at specific timestamps from a video.
 
     Use this when the user requests snapshots/screenshots at particular moments.
-    Downloads at best available quality and captures at original resolution
-    as lossless PNGs.
+    Returns compact base64 JPEGs (720p) in the response for the LLM to analyze.
+    If output_dir is set, also saves full-resolution PNG originals to disk.
 
     timestamps: list of timestamp strings, e.g. ["0:30", "2:45", "1:02:30"].
         Supports formats: "SS", "MM:SS", "HH:MM:SS".
-    output_dir: if provided, also saves frames to disk; otherwise only returns base64.
+    output_dir: if provided, also saves full-res frames to disk.
     """
     parsed = [_parse_timestamp(ts) for ts in timestamps]
     return _download_and_extract_frames(url, parsed, output_dir)
