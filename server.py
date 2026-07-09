@@ -7,8 +7,9 @@
 # ///
 """Local MCP server wrapping yt-dlp. No YouTube API key required.
 
-Exposes six tools:
+Exposes seven tools:
   - get_transcript: return captions as plain text
+  - extract_key_frames: auto-detect visually significant moments (scene changes)
   - extract_frames: capture frames at regular intervals for visual analysis
   - snapshot: capture frames at specific user-supplied timestamps
   - download_subtitles: write subtitle file(s) to disk
@@ -142,32 +143,61 @@ def _format_timestamp(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+MAX_RESPONSE_BYTES = 900_000  # stay safely under MCP's ~1MB tool response limit
+
+
+def _extract_frame_jpeg(
+    video_path: str,
+    ts: float,
+    out_path: str,
+    scale: int = 480,
+    quality: int = 8,
+) -> bool:
+    """Extract a single frame as a scaled JPEG. Returns True if file was created."""
+    subprocess.run(
+        [
+            "ffmpeg", "-ss", str(ts), "-i", video_path,
+            "-vframes", "1",
+            "-vf", f"scale=-2:{scale}",
+            "-q:v", str(quality),
+            "-y", out_path,
+        ],
+        capture_output=True,
+    )
+    return Path(out_path).exists()
+
+
 def _download_and_extract_frames(
     url: str,
     timestamps: list[float],
     output_dir: str | None,
+    *,
+    video_path: str | None = None,
+    info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Download a video and extract frames at the given timestamps.
+    """Download a video (if not already provided) and extract frames.
 
-    Strategy for staying within MCP tool response limits:
-    - Downloads video at 720p (sufficient for visual analysis, keeps frames small).
-    - Extracts frames as high-quality JPEG (q:v 2 ≈ 95% quality, ~50-150KB each).
+    Strategy for staying within MCP tool response limits (~1MB):
+    - Downloads video at 480p (sufficient for visual analysis, small frames).
+    - Extracts frames as JPEG at q:v 8, scaled to 480p (~15-35KB each).
+    - After encoding all frames, checks total base64 payload against the budget.
+      If over budget, re-encodes at progressively lower quality/resolution.
     - If output_dir is set, also saves full-resolution PNG originals to disk.
 
     Returns a dict with title, video_id, duration, and a list of frame entries
     each containing timestamp_seconds, timestamp, base64_jpeg, and optionally file_path.
     """
     with tempfile.TemporaryDirectory() as tmp:
-        video_path = str(Path(tmp) / "video.mp4")
-        # Download at 720p for base64 response (keeps payload manageable)
-        opts = {
-            **_quiet_opts(),
-            "format": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-            "merge_output_format": "mp4",
-            "outtmpl": video_path,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        if video_path is None:
+            video_path = str(Path(tmp) / "video.mp4")
+            opts = {
+                **_quiet_opts(),
+                "format": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+                "merge_output_format": "mp4",
+                "outtmpl": video_path,
+            }
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
 
         title = info.get("title", "")
         video_id = info.get("id", "")
@@ -176,26 +206,29 @@ def _download_and_extract_frames(
         frames_dir = Path(tmp) / "frames"
         frames_dir.mkdir()
 
-        # Extract frames as JPEG (high quality, compact size)
+        # Try progressively smaller settings until frames fit within budget
+        scale_quality_levels = [(480, 8), (360, 10), (240, 12)]
+
         frame_paths: list[Path] = []
-        for i, ts in enumerate(timestamps):
-            out_path = frames_dir / f"frame_{i:04d}.jpg"
-            subprocess.run(
-                [
-                    "ffmpeg", "-ss", str(ts), "-i", video_path,
-                    "-vframes", "1",
-                    "-q:v", "2",
-                    "-y", str(out_path),
-                ],
-                capture_output=True,
-            )
-            if out_path.exists():
-                frame_paths.append(out_path)
+        used_level = scale_quality_levels[0]
+
+        for scale, quality in scale_quality_levels:
+            frame_paths.clear()
+            for i, ts in enumerate(timestamps):
+                out_path = frames_dir / f"frame_{i:04d}.jpg"
+                if _extract_frame_jpeg(video_path, ts, str(out_path), scale, quality):
+                    frame_paths.append(out_path)
+
+            # Check total base64 size (base64 expands by ~4/3)
+            raw_total = sum(p.stat().st_size for p in frame_paths)
+            b64_total = (raw_total * 4) // 3
+            used_level = (scale, quality)
+            if b64_total <= MAX_RESPONSE_BYTES:
+                break
 
         # If output_dir specified, also save full-res originals
         save_dir = _expand_dir(output_dir) if output_dir else None
         if save_dir:
-            # Re-download at best quality for disk saves
             full_video_path = str(Path(tmp) / "video_full.mp4")
             full_opts = {
                 **_quiet_opts(),
@@ -236,8 +269,95 @@ def _download_and_extract_frames(
             "video_id": video_id,
             "duration_seconds": duration,
             "frame_count": len(frames_data),
+            "frame_resolution": f"{used_level[0]}p",
             "frames": frames_data,
         }
+
+
+def _detect_scene_changes(
+    video_path: str,
+    threshold: float = 0.3,
+    max_frames: int = 20,
+    min_gap: float = 2.0,
+) -> list[float]:
+    """Use ffmpeg scene detection to find timestamps where visuals change significantly.
+
+    threshold: scene change sensitivity (0.0-1.0). Lower = more sensitive.
+        0.3 works well for slides/diagrams, use 0.2 for subtle changes.
+    min_gap: minimum seconds between detected scenes to avoid duplicates.
+    """
+    result = subprocess.run(
+        [
+            "ffmpeg", "-i", video_path,
+            "-vf", f"select='gt(scene,{threshold})',showinfo",
+            "-vsync", "vfr",
+            "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    # Parse timestamps from ffmpeg showinfo output
+    timestamps: list[float] = []
+    for line in result.stderr.splitlines():
+        match = re.search(r"pts_time:([\d.]+)", line)
+        if match:
+            ts = float(match.group(1))
+            # Enforce minimum gap between frames
+            if not timestamps or (ts - timestamps[-1]) >= min_gap:
+                timestamps.append(ts)
+            if len(timestamps) >= max_frames:
+                break
+    return timestamps
+
+
+@mcp.tool()
+def extract_key_frames(
+    url: str,
+    threshold: float = 0.3,
+    max_frames: int = 20,
+    min_gap: float = 2.0,
+    output_dir: str | None = None,
+) -> dict[str, Any]:
+    """Auto-detect and capture visually significant moments from a video.
+
+    Uses ffmpeg scene change detection to find frames where the visual content
+    changes substantially — slide transitions, new diagrams, topic shifts, etc.
+    Much more accurate than fixed intervals for videos with visual content.
+
+    Returns compact base64 JPEGs (auto-scaled to fit within MCP size limits).
+    If output_dir is set, also saves full-resolution PNG originals to disk.
+
+    threshold: scene change sensitivity (0.0-1.0, default 0.3).
+        Lower values detect more subtle changes. Use 0.2 for dense content.
+    max_frames: cap on total frames returned (default 20).
+    min_gap: minimum seconds between detected scenes (default 2.0).
+    output_dir: if provided, also saves full-res frames to disk.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = str(Path(tmp) / "video_detect.mp4")
+        opts = {
+            **_quiet_opts(),
+            "format": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": video_path,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        timestamps = _detect_scene_changes(video_path, threshold, max_frames, min_gap)
+
+        if not timestamps:
+            # Fallback: if no scene changes detected, grab a frame at the start
+            timestamps = [0.0]
+
+        # Reuse the already-downloaded video instead of downloading again
+        result = _download_and_extract_frames(
+            url, timestamps, output_dir,
+            video_path=video_path, info=info,
+        )
+        result["detection_threshold"] = threshold
+        result["min_gap_seconds"] = min_gap
+        return result
 
 
 @mcp.tool()
@@ -249,29 +369,40 @@ def extract_frames(
 ) -> dict[str, Any]:
     """Extract frames from a video at regular intervals for visual analysis.
 
-    Returns compact base64 JPEGs (720p) in the response for the LLM to analyze.
+    Returns compact base64 JPEGs (auto-scaled to fit within MCP size limits).
     If output_dir is set, also saves full-resolution PNG originals to disk.
 
     interval_seconds: time between captures (default 10s).
     max_frames: cap on total frames returned (default 20).
     output_dir: if provided, also saves full-res frames to disk.
     """
-    # Fetch duration first to compute timestamps
-    with yt_dlp.YoutubeDL({**_quiet_opts(), "skip_download": True}) as ydl:
-        info = ydl.extract_info(url, download=False)
-    duration = info.get("duration") or 0
+    # Download once and use the video for both duration detection and frame extraction
+    with tempfile.TemporaryDirectory() as tmp:
+        video_path = str(Path(tmp) / "video.mp4")
+        opts = {
+            **_quiet_opts(),
+            "format": "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": video_path,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        duration = info.get("duration") or 0
 
-    timestamps: list[float] = []
-    t = 0.0
-    while t < duration and len(timestamps) < max_frames:
-        timestamps.append(t)
-        t += interval_seconds
-    if not timestamps:
-        timestamps = [0.0]
+        timestamps: list[float] = []
+        t = 0.0
+        while t < duration and len(timestamps) < max_frames:
+            timestamps.append(t)
+            t += interval_seconds
+        if not timestamps:
+            timestamps = [0.0]
 
-    result = _download_and_extract_frames(url, timestamps, output_dir)
-    result["interval_seconds"] = interval_seconds
-    return result
+        result = _download_and_extract_frames(
+            url, timestamps, output_dir,
+            video_path=video_path, info=info,
+        )
+        result["interval_seconds"] = interval_seconds
+        return result
 
 
 @mcp.tool()
@@ -283,7 +414,7 @@ def snapshot(
     """Capture frames at specific timestamps from a video.
 
     Use this when the user requests snapshots/screenshots at particular moments.
-    Returns compact base64 JPEGs (720p) in the response for the LLM to analyze.
+    Returns compact base64 JPEGs (auto-scaled to fit within MCP size limits).
     If output_dir is set, also saves full-resolution PNG originals to disk.
 
     timestamps: list of timestamp strings, e.g. ["0:30", "2:45", "1:02:30"].
